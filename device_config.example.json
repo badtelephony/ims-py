@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to device_config.json and set your handset's IMEI (15 digits). This file holds device identity, NOT carrier config (those live in badtelephony-bundles/). Overridable with --imei.",
+  "imei": "000000000000000"
+}

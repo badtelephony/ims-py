@@ -1,0 +1,4 @@
+device_config.json
+__pycache__/
+*.pyc
+unused_old/
