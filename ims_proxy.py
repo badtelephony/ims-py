@@ -270,6 +270,56 @@ class MediaRelay:
                 pass
 
 
+class ServerConn:
+    """An inbound TCP connection the P-CSCF opened to us"""
+
+    def __init__(self, sock, peer):
+        self.sock = sock
+        self.peer = peer
+        self.buf = b""
+        self.last_raw = b""
+        self._send_lock = threading.Lock()
+
+    def _extract(self):
+        if b"\r\n\r\n" not in self.buf:
+            return None
+        head, sep, rest = self.buf.partition(b"\r\n\r\n")
+        clen = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                try:
+                    clen = int(line.split(b":", 1)[1].strip())
+                except ValueError:
+                    clen = 0
+        if len(rest) < clen:
+            return None
+        msg = head + sep + rest[:clen]
+        self.buf = rest[clen:]
+        self.last_raw = msg
+        return msg.decode(errors="replace")
+
+    def recv(self, timeout):
+        self.sock.settimeout(timeout)
+        while True:
+            msg = self._extract()
+            if msg is not None:
+                return msg
+            chunk = self.sock.recv(8192)
+            if not chunk:
+                return None          # peer closed
+            self.buf += chunk
+
+    def send(self, msg):
+        with self._send_lock:
+            self.sock.sendall(msg.encode())
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class Call:
     """A bridged call: one access-side dialog + one network-side dialog."""
 
@@ -299,8 +349,10 @@ class Call:
         self.ims_answer = None        # SDP answer body from IMS (often in 183)
         self.acc_answer_sent = False  # have we given baresip the answer SDP yet?
         # Transient TCP leg for the MO INVITE transaction. Needed for bigger messages like INVITE which break the UDP MTU and seem to get dropped.
-        self.n_tcp = None             # ims.Transport (TCP) or None
-        self.n_tcp_port = None        # its local port, advertised in the TCP Via
+        self.n_tcp = None             # ims.Transport (MO leg) / ServerConn (MT) / None
+        self.n_tcp_port = None        # MO leg local port, advertised in the TCP Via
+        self.n_tcp_owned = False      # True only for an MO leg we opened (we FIN it);
+        #                               a shared inbound MT conn is left to its loop
 
 
 class Proxy:
@@ -323,6 +375,12 @@ class Proxy:
         self.transport = ims.BUNDLE.transport   # Gm transport from the bundle
         self.fam = socket.AF_INET6 if ":" in args.pcscf else socket.AF_INET
         self.T = None
+        self.srv = None          # inbound TCP listener (UDP mode: for MT/NOTIFY)
+        # Per-thread "which inbound connection delivered the request we're
+        # handling" so a response goes back where it came from (the accepted TCP
+        # conn) instead of the persistent UDP socket. Unset on UDP-reader/timer
+        # threads -> falls back to UDP.
+        self._inbound = threading.local()
         self.net_port = None
         self.net_local = args.local or ims.detect_local(args.pcscf, args.port,
                                                          self.fam)
@@ -330,6 +388,14 @@ class Proxy:
         # discards loopback addresses (127/8, ::1), so we bind a non-loopback
         # tunnel address. Prefer a stable ULA (fd00::1) added to tun1 if present
         # the SLAAC globals rotate per ePDG session, the ULA does not.
+        # UDP Gm mirrors a real handset: the network side must own :5060 (the
+        # port Verizon delivers terminating INVITEs to -- it does NOT dial our
+        # ephemeral Contact port, so MT silently no-shows there). That means the
+        # access side (baresip<->proxy) has to move off 5060.
+        if self.transport == "udp" and args.listen_port == 5060:
+            args.listen_port = 6060
+            log("access side -> :6060 (Gm/network side takes :5060 for MT, like "
+                "a handset); baresip account is rewritten via --write-account")
         listen = args.listen or self.net_local
         self.afam = socket.AF_INET6 if ":" in listen else socket.AF_INET
         self.acc = socket.socket(self.afam, socket.SOCK_DGRAM)
@@ -486,8 +552,9 @@ class Proxy:
         """
         proto = self.transport
         bind_local = self.net_local if proto == "udp" else self.args.local
+        net_src = (self.args.src_port or 5060) if proto == "udp" else self.args.src_port
         try:
-            self.T = ims.Transport(self.fam, bind_local, self.args.src_port,
+            self.T = ims.Transport(self.fam, bind_local, net_src,
                                    self.args.pcscf, self.args.port, proto,
                                    self.args.timeout)
         except OSError as e:
@@ -501,7 +568,70 @@ class Proxy:
             f"{self.args.pcscf}:{self.args.port}"
             + ("  UDP " if proto == "udp" else " TCP "))
         threading.Thread(target=self.net_rx_loop, daemon=True).start()
+        if proto == "udp":
+            self.start_inbound_listener()
         return True
+
+    def start_inbound_listener(self):
+        """Listen on TCP at the same host:port we advertise in Contact. Verizon
+        delivers MT INVITEs and reg-event NOTIFYs by opening a TCP connection to
+        the registered Contact (which is stupid by the way)
+         (the persistent flow is UDP, so without this the P-CSCF's inbound 
+         SYN is refused and incoming calls silently fail). It would make so much more
+         sense to have everything over one TCP socket but whatever."""
+        if self.srv is not None:
+            try:
+                self.srv.close()
+            except OSError:
+                pass
+        try:
+            srv = socket.socket(self.fam, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.net_local, self.net_port))   # same port as the UDP flow
+            srv.listen(8)
+        except OSError as e:
+            log(f"WARNING: inbound TCP listener on {vh(self.net_local)}:"
+                f"{self.net_port} failed: {e}; MT calls/NOTIFY that arrive over "
+                "TCP will be missed")
+            self.srv = None
+            return
+        self.srv = srv
+        threading.Thread(target=self.tcp_accept_loop, daemon=True).start()
+        log(f"inbound: TCP listen {vh(self.net_local)}:{self.net_port} "
+            "(P-CSCF-initiated MT INVITE / NOTIFY)")
+
+    def tcp_accept_loop(self):
+        srv = self.srv
+        while self.running and self.srv is srv:
+            try:
+                conn, peer = srv.accept()
+            except OSError:
+                return
+            sc = ServerConn(conn, peer)
+            log(f"inbound TCP from P-CSCF {vh(peer[0])}:{peer[1]}")
+            threading.Thread(target=self.net_conn_loop, args=(sc,),
+                             daemon=True).start()
+
+    def net_conn_loop(self, sc: ServerConn):
+        """Read requests off one inbound P-CSCF TCP connection and dispatch them
+        through on_network; responses go back on this same conn (via the
+        per-thread _inbound.conn that net_reply / handle_mt_invite read)."""
+        self._inbound.conn = sc
+        while self.running:
+            try:
+                raw = sc.recv(1.0)
+            except socket.timeout:
+                continue
+            except (ConnectionError, OSError):
+                break
+            if raw is None:
+                break
+            self.trace("RX", "NET", raw, sc.peer)
+            try:
+                self.on_network(raw)
+            except Exception as e:
+                log("network handler error (inbound tcp):", e)
+        sc.close()
 
     def _bringup(self):
         if self.T is None and not self.connect_network():
@@ -534,6 +664,7 @@ class Proxy:
             return False
         call.n_tcp = t
         call.n_tcp_port = t.local_port
+        call.n_tcp_owned = True       # ours to FIN when the call ends
         threading.Thread(target=self.net_tcp_rx_loop, args=(call,),
                          daemon=True).start()
         log(f"INVITE TCP leg up: {vh(t.local)}:{t.local_port} -> "
@@ -557,16 +688,34 @@ class Proxy:
             except Exception as e:
                 log("network handler error (tcp leg):", e)
 
-    def close_invite_tcp(self, call: Call):
+    def release_call_tcp(self, call: Call):
+        """Detach the call's TCP socket. An MO leg we opened is FIN'd; a shared
+        inbound MT connection is only detached (its conn loop owns its close)."""
         t = call.n_tcp
+        owned = call.n_tcp_owned
         call.n_tcp = None          # signals net_tcp_rx_loop to exit
-        if t is not None:
+        call.n_tcp_owned = False
+        if t is not None and owned:
             t.close()
 
-    def net_send_invite_leg(self, call: Call, msg):
-        """Send an INVITE-transaction message (INVITE/ACK/CANCEL) on the call's
-        TCP leg; fall back to the persistent socket when there is none."""
-        if call.n_tcp is None:
+    def net_reply(self, msg):
+        """Respond to an inbound request on the connection it arrived on: the
+        per-thread inbound TCP conn if set (a P-CSCF-initiated connection), else
+        the persistent UDP socket."""
+        sc = getattr(self._inbound, "conn", None)
+        if sc is None:
+            return self.net_send(msg)
+        self.trace("TX", "NET", msg, sc.peer)
+        try:
+            sc.send(msg)
+        except OSError as e:
+            log(f"inbound-conn reply failed: {e}")
+
+    def net_send_call(self, call: Call, msg):
+        """Send a network-side message bound to this call on its associated TCP
+        socket (MO INVITE leg or the inbound MT conn) if any, else over UDP.
+        Covers INVITE/ACK/CANCEL on the MO leg and the async 18x/200 on MT."""
+        if call is None or call.n_tcp is None:
             return self.net_send(msg)
         self.trace("TX", "NET", msg, (self.args.pcscf, self.args.port))
         with self.send_lock:
@@ -576,7 +725,7 @@ class Proxy:
             try:
                 t.send(msg)
             except OSError as e:
-                log(f"INVITE-leg TCP send failed: {e}")
+                log(f"call-leg TCP send failed: {e}")
 
     # ---- network-side message builders -----------------------------------
     def n_via(self, branch):
@@ -739,7 +888,7 @@ class Proxy:
             self.calls_by_a.pop(call.a_callid, None)
         if call.media:
             call.media.stop()
-        self.close_invite_tcp(call)   # FIN the transient INVITE TCP leg, if any
+        self.release_call_tcp(call)
         call.state = "ended"
 
     # ====================================================================== #
@@ -834,7 +983,7 @@ class Proxy:
         relay.start()
         if self.transport == "udp":
             self.open_invite_tcp(call)
-        self.net_send_invite_leg(call, self.build_net_invite(call, net_sdp))
+        self.net_send_call(call, self.build_net_invite(call, net_sdp))
         log(f"MO call -> {call.n_target}  (a={call.a_callid[:8]} n={call.n_callid[:8]})")
 
     def handle_acc_cancel(self, headers):
@@ -843,7 +992,7 @@ class Proxy:
         # 200 to the CANCEL itself; the INVITE will get a 487 we relay from IMS.
         self.acc_send(self.a_response(headers, 200, "OK"))
         if call and call.state in ("inviting", "ringing"):
-            self.net_send_invite_leg(call, self.net_cancel(call))
+            self.net_send_call(call, self.net_cancel(call))
             log("MO CANCEL relayed to IMS")
 
     def handle_acc_bye(self, headers):
@@ -872,6 +1021,7 @@ class Proxy:
     #  NETWORK SIDE  (messages from the IMS / P-CSCF)                        #
     # ====================================================================== #
     def net_rx_loop(self):
+        self._inbound.conn = None   # this thread replies over the UDP socket
         while self.running and self.T is not None:
             try:
                 raw = self.T.recv(1.0)
@@ -963,7 +1113,7 @@ class Proxy:
 
         if 200 <= code < 300:
             # ACK the IMS 200 (we are the UAC) on the INVITE's leg (TCP).
-            self.net_send_invite_leg(
+            self.net_send_call(
                 call, self.net_indialog("ACK", call, call.n_invite_cseq, leg=True))
             # If baresip hasn't been given the answer yet (no 183 carried it),
             # include it now; otherwise the 200 needs no body (already answered).
@@ -1008,7 +1158,7 @@ class Proxy:
         if method == "INVITE" and not call:
             return self.handle_mt_invite(headers, body)
         if method == "BYE":
-            self.net_send(self.net_response(headers, 200, "OK"))
+            self.net_reply(self.net_response(headers, 200, "OK"))
             if call:
                 if call.a_callid in self.calls_by_a and call.state == "up":
                     self.acc_send(self.a_request("BYE", call, call.n_cseq))
@@ -1016,7 +1166,7 @@ class Proxy:
                 self.drop_call(call)
             return
         if method == "CANCEL":
-            self.net_send(self.net_response(headers, 200, "OK"))
+            self.net_reply(self.net_response(headers, 200, "OK"))
             if call and call.state != "up":
                 # caller gave up while ringing. For MT, CANCEL baresip's INVITE;
                 # for MO we are baresip's UAS, so 487 the pending INVITE.
@@ -1029,17 +1179,17 @@ class Proxy:
                 self.drop_call(call)
             return
         if method in ("UPDATE", "INVITE"):  # session-timer refresh / re-INVITE
-            self.net_send(self.net_response(headers, 200, "OK", body=body or None,
-                                            totag=call.n_rtag if call else None))
+            self.net_reply(self.net_response(headers, 200, "OK", body=body or None,
+                                             totag=call.n_rtag if call else None))
             return
         if method == "OPTIONS":
-            self.net_send(self.net_response(headers, 200, "OK", extra=[ALLOW]))
+            self.net_reply(self.net_response(headers, 200, "OK", extra=[ALLOW]))
             return
         if method == "MESSAGE":
             self.handle_net_message(headers)
             return
         if method in ("NOTIFY", "INFO", "PRACK"):
-            self.net_send(self.net_response(headers, 200, "OK"))
+            self.net_reply(self.net_response(headers, 200, "OK"))
             return
 
     # inbound SMS over IMS (X.S0048)
@@ -1051,12 +1201,16 @@ class Proxy:
         softphone as an ordinary text/plain MESSAGE. Sending SMS (MO) is not
         implemented yet.
         """
-        self.net_send(self.net_response(headers, 200, "OK"))
+        self.net_reply(self.net_response(headers, 200, "OK"))
         ctype = headers.get("content-type", [""])[0].lower()
         if "application/vnd.3gpp2.sms" not in ctype:
             log(f"IMS MESSAGE ({ctype or 'no content-type'}); not 3GPP2 SMS, ignored. Feel free to PR in reg 3GPP SMS")
             return
-        raw = self.T.last_raw if self.T else b""
+        # The binary body's exact bytes come from whichever link delivered it
+        # (an inbound TCP conn or the persistent UDP socket); the str path is
+        # lossy for binary.
+        sc = getattr(self._inbound, "conn", None)
+        raw = sc.last_raw if sc is not None else (self.T.last_raw if self.T else b"")
         sms_bytes = raw.partition(b"\r\n\r\n")[2]
         try:
             clen = int(headers.get("content-length", ["0"])[0])
@@ -1126,10 +1280,14 @@ class Proxy:
     def handle_mt_invite(self, headers, body):
         if not self.acc_contact:
             # No softphone registered to take the call.
-            self.net_send(self.net_response(headers, 480, "Temporarily Unavailable"))
+            self.net_reply(self.net_response(headers, 480, "Temporarily Unavailable"))
             log("MT INVITE but no access UA registered 480")
             return
         call = Call("MT")
+        # Bind the call to whatever delivered the INVITE (a P-CSCF-initiated TCP
+        # conn, or None for UDP) so the async 18x/200 from baresip go back there.
+        call.n_tcp = getattr(self._inbound, "conn", None)
+        call.n_tcp_owned = False     # shared inbound conn: its loop closes it
         call.n_callid = headers.get("call-id", [""])[0]
         call.n_rtag = call.a_our_tag  # our tag in the IMS dialog
         call.n_ftag = get_tag(headers.get("from", [""])[0])
@@ -1152,7 +1310,7 @@ class Proxy:
             self.calls_by_n[call.n_callid] = call
             self.calls_by_a[call.a_callid] = call
 
-        self.net_send(self.net_response(headers, 100, "Trying"))
+        self.net_reply(self.net_response(headers, 100, "Trying"))
         relay.start()
         self.acc_send(self.build_mt_invite(call, caller, acc_sdp))
         log(f"MT call from {caller} -> baresip (n={call.n_callid[:8]})")
@@ -1215,8 +1373,8 @@ class Proxy:
             call.a_contact = get_uri(headers["contact"][0])
         if 100 <= code < 200:
             if code in (180, 183):
-                self.net_send(self.net_response(call.n_invite_headers, 180,
-                                                "Ringing", totag=call.n_rtag))
+                self.net_send_call(call, self.net_response(
+                    call.n_invite_headers, 180, "Ringing", totag=call.n_rtag))
             return
         if 200 <= code < 300:
             # We are the UAC toward baresip: ACK its 200 (else baresip keeps
@@ -1231,15 +1389,15 @@ class Proxy:
                                   call.media.net_rtcp_port) if body.strip() else ""
             # 2xx answer to IMS MUST carry Contact (contact=True) or IMS can't
             # ACK it and CANCELs the call.
-            self.net_send(self.net_response(call.n_invite_headers, 200, "OK",
-                                            body=net_sdp, totag=call.n_rtag,
-                                            contact=True))
+            self.net_send_call(call, self.net_response(
+                call.n_invite_headers, 200, "OK", body=net_sdp,
+                totag=call.n_rtag, contact=True))
             call.state = "up"
             log("MT call answered: media bridged")
             return
         # baresip rejected the call
-        self.net_send(self.net_response(call.n_invite_headers, code,
-                                        first_reason(code), totag=call.n_rtag))
+        self.net_send_call(call, self.net_response(
+            call.n_invite_headers, code, first_reason(code), totag=call.n_rtag))
         self.drop_call(call)
 
     # ---- misc -------------------------------------------------------------
@@ -1328,6 +1486,11 @@ class Proxy:
             log("shutting down")
         finally:
             self.running = False
+            if self.srv is not None:
+                try:
+                    self.srv.close()
+                except OSError:
+                    pass
             for call in list(self.calls_by_n.values()):
                 self.drop_call(call)
 
