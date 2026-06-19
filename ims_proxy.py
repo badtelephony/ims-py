@@ -58,6 +58,7 @@ import time
 
 import sim_aka
 import carrier
+import sms_3gpp2
 import ims_call as ims
 
 from ims_call import (
@@ -297,6 +298,9 @@ class Call:
         self.n_pracked = set()
         self.ims_answer = None        # SDP answer body from IMS (often in 183)
         self.acc_answer_sent = False  # have we given baresip the answer SDP yet?
+        # Transient TCP leg for the MO INVITE transaction. Needed for bigger messages like INVITE which break the UDP MTU and seem to get dropped.
+        self.n_tcp = None             # ims.Transport (TCP) or None
+        self.n_tcp_port = None        # its local port, advertised in the TCP Via
 
 
 class Proxy:
@@ -475,24 +479,27 @@ class Proxy:
 
     # ---- upstream bring-up (P-CSCF connect + register), retried -----------
     def connect_network(self):
-        """Open the TCP connection to the P-CSCF and start its reader.
+        """Open the P-CSCF transport and start its reader.
 
         Separate from __init__ so a stale/unreachable --pcscf only delays the
         upstream side; the access side is already serving baresip.
         """
+        proto = self.transport
+        bind_local = self.net_local if proto == "udp" else self.args.local
         try:
-            self.T = ims.Transport(self.fam, self.args.local, self.args.src_port,
-                                   self.args.pcscf, self.args.port, self.transport,
+            self.T = ims.Transport(self.fam, bind_local, self.args.src_port,
+                                   self.args.pcscf, self.args.port, proto,
                                    self.args.timeout)
         except OSError as e:
-            log(f"P-CSCF TCP connect to {self.args.pcscf}:{self.args.port} "
+            log(f"P-CSCF {proto.upper()} setup to {self.args.pcscf}:{self.args.port} "
                 f"FAILED: {e} (stale P-CSCF for this session?)")
             self.T = None
             return False
         self.net_local = self.T.local
         self.net_port = self.T.local_port
-        log(f"P-CSCF connected: TCP {self.net_local}:{self.net_port} -> "
-            f"{self.args.pcscf}:{self.args.port}")
+        log(f"P-CSCF {proto.upper()} {self.net_local}:{self.net_port} -> "
+            f"{self.args.pcscf}:{self.args.port}"
+            + ("  UDP " if proto == "udp" else " TCP "))
         threading.Thread(target=self.net_rx_loop, daemon=True).start()
         return True
 
@@ -514,15 +521,80 @@ class Proxy:
         else:
             self._schedule_retry()
 
+    def open_invite_tcp(self, call: Call):
+        """Open a short-lived TCP connection for one MO INVITE transaction and
+        start a reader for its responses. On failure the caller
+        falls back to sending the INVITE over the persistent UDP socket."""
+        try:
+            t = ims.Transport(self.fam, self.net_local, 0, self.args.pcscf,
+                              self.args.port, "tcp", self.args.timeout)
+        except OSError as e:
+            log(f"INVITE TCP leg connect FAILED: {e}; INVITE will go over UDP "
+                "(may fragment if >MTU)")
+            return False
+        call.n_tcp = t
+        call.n_tcp_port = t.local_port
+        threading.Thread(target=self.net_tcp_rx_loop, args=(call,),
+                         daemon=True).start()
+        log(f"INVITE TCP leg up: {vh(t.local)}:{t.local_port} -> "
+            f"{self.args.pcscf}:{self.args.port} (n={call.n_callid[:8]})")
+        return True
+
+    def net_tcp_rx_loop(self, call: Call):
+        """Read INVITE responses off this call's transient TCP leg and dispatch
+        them through the same on_network path as the UDP socket."""
+        t = call.n_tcp
+        while self.running and call.n_tcp is t:
+            try:
+                raw = t.recv(1.0)
+            except socket.timeout:
+                continue
+            except (ConnectionError, OSError):
+                return
+            self.trace("RX", "NET", raw, (self.args.pcscf, self.args.port))
+            try:
+                self.on_network(raw)
+            except Exception as e:
+                log("network handler error (tcp leg):", e)
+
+    def close_invite_tcp(self, call: Call):
+        t = call.n_tcp
+        call.n_tcp = None          # signals net_tcp_rx_loop to exit
+        if t is not None:
+            t.close()
+
+    def net_send_invite_leg(self, call: Call, msg):
+        """Send an INVITE-transaction message (INVITE/ACK/CANCEL) on the call's
+        TCP leg; fall back to the persistent socket when there is none."""
+        if call.n_tcp is None:
+            return self.net_send(msg)
+        self.trace("TX", "NET", msg, (self.args.pcscf, self.args.port))
+        with self.send_lock:
+            t = call.n_tcp
+            if t is None:
+                return
+            try:
+                t.send(msg)
+            except OSError as e:
+                log(f"INVITE-leg TCP send failed: {e}")
+
     # ---- network-side message builders -----------------------------------
     def n_via(self, branch):
         return (f"Via: SIP/2.0/{self.transport.upper()} {vh(self.net_local)}:{self.net_port}"
                 f";branch={branch};rport")
 
+    def n_via_call(self, call: Call, branch):
+        """Via for a request on this call's INVITE transaction: TCP (the leg's
+        port) if it has a transient TCP leg, else the persistent transport."""
+        if call.n_tcp is not None:
+            return (f"Via: SIP/2.0/TCP {vh(self.net_local)}:{call.n_tcp_port}"
+                    f";branch={branch};rport")
+        return self.n_via(branch)
+
     def build_net_invite(self, call: Call, sdp: str):
         lines = [
             f"INVITE {call.n_target} SIP/2.0",
-            self.n_via(call.n_branch),
+            self.n_via_call(call, call.n_branch),
             "Max-Forwards: 70",
         ]
         for r in self.service_route:
@@ -546,9 +618,11 @@ class Proxy:
         ]
         return "\r\n".join(lines)
 
-    def net_indialog(self, method, call: Call, cseq, extra=None, body=None):
+    def net_indialog(self, method, call: Call, cseq, extra=None, body=None,
+                     leg=False):
         route = call.n_route or self.service_route
-        lines = [f"{method} {call.n_target} SIP/2.0", self.n_via(br()),
+        via = self.n_via_call(call, br()) if leg else self.n_via(br())
+        lines = [f"{method} {call.n_target} SIP/2.0", via,
                  "Max-Forwards: 70"]
         for r in route:
             lines.append(f"Route: <{r}>")
@@ -567,7 +641,7 @@ class Proxy:
     def net_cancel(self, call: Call):
         lines = [
             f"CANCEL {call.n_target} SIP/2.0",
-            self.n_via(call.n_branch),     # CANCEL must match the INVITE's top Via
+            self.n_via_call(call, call.n_branch),  # must match the INVITE's Via
             "Max-Forwards: 70",
         ]
         for r in self.service_route:
@@ -665,6 +739,7 @@ class Proxy:
             self.calls_by_a.pop(call.a_callid, None)
         if call.media:
             call.media.stop()
+        self.close_invite_tcp(call)   # FIN the transient INVITE TCP leg, if any
         call.state = "ended"
 
     # ====================================================================== #
@@ -757,7 +832,9 @@ class Proxy:
         # 100 Trying to baresip, INVITE to IMS.
         self.acc_send(self.a_response(headers, 100, "Trying"))
         relay.start()
-        self.net_send(self.build_net_invite(call, net_sdp))
+        if self.transport == "udp":
+            self.open_invite_tcp(call)
+        self.net_send_invite_leg(call, self.build_net_invite(call, net_sdp))
         log(f"MO call -> {call.n_target}  (a={call.a_callid[:8]} n={call.n_callid[:8]})")
 
     def handle_acc_cancel(self, headers):
@@ -766,7 +843,7 @@ class Proxy:
         # 200 to the CANCEL itself; the INVITE will get a 487 we relay from IMS.
         self.acc_send(self.a_response(headers, 200, "OK"))
         if call and call.state in ("inviting", "ringing"):
-            self.net_send(self.net_cancel(call))
+            self.net_send_invite_leg(call, self.net_cancel(call))
             log("MO CANCEL relayed to IMS")
 
     def handle_acc_bye(self, headers):
@@ -801,6 +878,9 @@ class Proxy:
             except socket.timeout:
                 continue
             except (ConnectionError, OSError) as e:
+                if self.transport == "udp":
+                    log(f"network recv error (udp, ignored): {e}")
+                    continue
                 log(f"P-CSCF connection lost: {e} access side stays up, "
                     "reconnecting in 5s")
                 self.T = None
@@ -882,8 +962,9 @@ class Proxy:
             return
 
         if 200 <= code < 300:
-            # ACK the IMS 200 (we are the UAC).
-            self.net_send(self.net_indialog("ACK", call, call.n_invite_cseq))
+            # ACK the IMS 200 (we are the UAC) on the INVITE's leg (TCP).
+            self.net_send_invite_leg(
+                call, self.net_indialog("ACK", call, call.n_invite_cseq, leg=True))
             # If baresip hasn't been given the answer yet (no 183 carried it),
             # include it now; otherwise the 200 needs no body (already answered).
             acc_sdp = ""
@@ -954,9 +1035,92 @@ class Proxy:
         if method == "OPTIONS":
             self.net_send(self.net_response(headers, 200, "OK", extra=[ALLOW]))
             return
-        if method in ("NOTIFY", "MESSAGE", "INFO", "PRACK"):
+        if method == "MESSAGE":
+            self.handle_net_message(headers)
+            return
+        if method in ("NOTIFY", "INFO", "PRACK"):
             self.net_send(self.net_response(headers, 200, "OK"))
             return
+
+    # inbound SMS over IMS (X.S0048)
+    def handle_net_message(self, headers):
+        """An MT short message: a SIP MESSAGE carrying a binary 3GPP2 SMS.
+
+        Per X.S0048 7.3.2.3 we 200 OK it (RFC 3428) so the network stops
+        retransmitting, decode the C.S0015 body, and hand the text to the
+        softphone as an ordinary text/plain MESSAGE. Sending SMS (MO) is not
+        implemented yet.
+        """
+        self.net_send(self.net_response(headers, 200, "OK"))
+        ctype = headers.get("content-type", [""])[0].lower()
+        if "application/vnd.3gpp2.sms" not in ctype:
+            log(f"IMS MESSAGE ({ctype or 'no content-type'}); not 3GPP2 SMS, ignored. Feel free to PR in reg 3GPP SMS")
+            return
+        raw = self.T.last_raw if self.T else b""
+        sms_bytes = raw.partition(b"\r\n\r\n")[2]
+        try:
+            clen = int(headers.get("content-length", ["0"])[0])
+        except ValueError:
+            clen = 0
+        if clen and len(sms_bytes) >= clen:
+            sms_bytes = sms_bytes[:clen]
+        try:
+            sms = sms_3gpp2.decode(sms_bytes)
+        except Exception as e:
+            log(f"3GPP2 SMS decode failed: {e}  raw={sms_bytes.hex()}")
+            return
+        sender = sms.get("orig_addr") or \
+            self.extract_number(headers.get("from", [""])[0]) or "unknown"
+        sender = self._fmt_msisdn(sender)
+        text = sms.get("text", "")
+        stamp = f"  (sent {sms['timestamp']})" if sms.get("timestamp") else ""
+        log(f"*** SMS from {sender}: {text!r}{stamp}")
+        # Only a Deliver carries user content for the softphone; acks/reports
+        # (delivery-ack, user-ack, read-ack) are logged but not forwarded.
+        mtype = sms.get("message_type")
+        if mtype not in (None, "deliver"):
+            log(f"    (SMS transport message type {mtype}; not forwarded to client)")
+            return
+        self.deliver_sms_to_access(sender, text)
+
+    @staticmethod
+    def _fmt_msisdn(number: str) -> str:
+        d = re.sub(r"[^\d+]", "", number)
+        if not d or d.startswith("+"):
+            return d or number
+        if len(d) == 10:
+            return "+1" + d
+        if len(d) == 11 and d.startswith("1"):
+            return "+" + d
+        return d
+
+    def deliver_sms_to_access(self, sender, text):
+        if not self.acc_contact or not self.acc_peer:
+            log("SMS received but no softphone registered; not delivered "
+                "(register baresip to pick it up)")
+            return
+        self.acc_send(self.build_acc_message(sender, text))
+        log(f"SMS delivered to softphone as text/plain (from {sender})")
+
+    def build_acc_message(self, sender, text):
+        """Out-of-dialog SIP MESSAGE towards baresip (RFC 3428, text/plain)."""
+        target = get_uri(self.acc_contact)
+        blen = len(text.encode())
+        lines = [
+            f"MESSAGE {target} SIP/2.0",
+            f"Via: SIP/2.0/UDP {vh(self.listen)}:{self.listen_port}"
+            f";branch={br()};rport",
+            "Max-Forwards: 70",
+            f'From: "{sender}" <sip:{sender}@{self.home}>;tag={secrets.token_hex(6)}',
+            f"To: <{target}>",
+            f"Call-ID: {secrets.token_hex(12)}",
+            "CSeq: 1 MESSAGE",
+            f"Contact: <sip:{self.msisdn}@{vh(self.listen)}:{self.listen_port}>",
+            "Content-Type: text/plain;charset=UTF-8",
+            f"Content-Length: {blen}",
+            "", text,
+        ]
+        return "\r\n".join(lines)
 
     # ---- MT (incoming) call ----------------------------------------------
     def handle_mt_invite(self, headers, body):
@@ -1127,8 +1291,8 @@ class Proxy:
     # ---- run --------------------------------------------------------------
     def run(self):
         ensure_lo_up()
-        log(f"network: TCP {self.net_local} -> {self.args.pcscf}:{self.args.port} "
-            "(connecting in run)")
+        log(f"network: {self.transport.upper()} {self.net_local} -> "
+            f"{self.args.pcscf}:{self.args.port} (connecting in run)")
         log(f"access : UDP [::]:{self.listen_port} (wildcard) "
             f"advertising {vh(self.listen)}")
         log("live local IPv6 addresses (baresip MUST target one of these):")

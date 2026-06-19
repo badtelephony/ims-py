@@ -2,7 +2,7 @@
   "name": "Verizon Wireless",
   "mccmnc": "311480",
   "domain": "vzims.com",
-  "transport": "tcp",
+  "transport": "udp",
   "user_agent": "APPLE---iPhone---17.6.1",
   "p_access_network_info": "IEEE-802.11;country=US;i-wlan-node-id=ffffffffffff",
   "contact_features": [

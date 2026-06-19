@@ -102,6 +102,21 @@ def imei_urn(imei):
 
 
 # transport (TCP framed / UDP)
+def _enable_tcp_keepalive(sock, idle=20, intvl=15, cnt=4):
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    for opt, val in (("TCP_KEEPIDLE", idle), ("TCP_KEEPINTVL", intvl),
+                     ("TCP_KEEPCNT", cnt)):
+        num = getattr(socket, opt, None)
+        if num is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, num, val)
+            except OSError:
+                pass
+
+
 class Transport:
     """One connection to the P-CSCF. TCP frames by Content-Length; UDP is 1:1."""
 
@@ -112,6 +127,7 @@ class Transport:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.settimeout(timeout)
         if proto == "tcp":
+            _enable_tcp_keepalive(self.sock)
             if local:
                 self.sock.bind((local, 0))
             self.sock.connect((pcscf, port))
@@ -120,6 +136,7 @@ class Transport:
         self.local = self.sock.getsockname()[0]
         self.local_port = self.sock.getsockname()[1]
         self.buf = b""
+        self.last_raw = b""
 
     def send(self, msg):
         data = msg.encode()
@@ -127,6 +144,12 @@ class Transport:
             self.sock.sendall(data)
         else:
             self.sock.sendto(data, (self.pcscf, self.port))
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
     def _extract(self):
         if b"\r\n\r\n" not in self.buf:
@@ -143,12 +166,14 @@ class Transport:
             return None
         msg = head + sep + rest[:clen]
         self.buf = rest[clen:]
+        self.last_raw = msg
         return msg.decode(errors="replace")
 
     def recv(self, timeout):
         self.sock.settimeout(timeout)
         if self.proto == "udp":
             data, _ = self.sock.recvfrom(65535)
+            self.last_raw = data
             return data.decode(errors="replace")
         while True:
             msg = self._extract()
